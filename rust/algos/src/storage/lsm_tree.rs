@@ -1,29 +1,37 @@
-extern crate rbtree;
+extern crate ciborium;
+extern crate serde;
+
 use super::kvstore;
 use super::rbtree::RBTree;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 type IOResult<T> = Result<T, io::Error>;
 
-pub struct LSMTree<K: Ord, V> {
+pub struct LSMTree<K: Ord + Hash, V> {
     storage_dir: PathBuf,
     segment_files: Vec<PathBuf>,
-    next_segment_index: u32,
+    index: HashMap<K, (u32, usize)>,
+    records_per_index: usize,
+    next_segment_num: u32,
     memtable: RBTree<K, V>,
     memtable_max_size: usize,
 }
 
-impl<K: Ord + Serialize, V: Serialize> LSMTree<K, V> {
+impl<K: Ord + Serialize + Hash + Copy, V: Serialize> LSMTree<K, V> {
     pub fn new(storage_dir: &Path) -> IOResult<Self> {
         fs::create_dir_all(storage_dir)?;
 
         Ok(LSMTree {
             storage_dir: storage_dir.to_owned(),
             segment_files: Vec::new(),
-            next_segment_index: 0,
+            index: HashMap::new(),
+            records_per_index: 4,
+            next_segment_num: 0,
             memtable: RBTree::new(),
             memtable_max_size: 16,
         })
@@ -36,28 +44,40 @@ impl<K: Ord + Serialize, V: Serialize> LSMTree<K, V> {
 
     // fn compact_segments() TODO
 
-    fn serialise_memtable(&self) -> Result<Vec<u8>, serde_json::Error> {
-        // TODO: Replace with efficient binary serialisation, or use a passed in serialiser
-        serde_json::to_vec(&self.memtable)
-    }
-
     fn write_new_segment(&mut self) -> IOResult<&Path> {
-        let segment_path = &self
-            .storage_dir
-            .join(format!("seg_{}", self.next_segment_index));
+        let segment_num = self.next_segment_num;
+        let segment_path = &self.storage_dir.join(format!("{}", segment_num));
 
-        fs::File::create(segment_path)?.write_all(&self.serialise_memtable()?)?;
+        let memtable_vec: Vec<(&K, &V)> = self.memtable.iter().collect();
+        let mut buffer = Vec::<u8>::new();
+        let mut index: HashMap<K, (u32, usize)> = HashMap::new();
+
+        for kv_chunk in memtable_vec.chunks(self.records_per_index) {
+            let key_offset = buffer.len();
+
+            //TODO: Handle error
+            ciborium::ser::into_writer(&self.memtable, &mut buffer);
+            let (index_key, _) = *kv_chunk.first().unwrap();
+
+            index.insert(*index_key, (segment_num, key_offset));
+        }
+
+        fs::File::create(segment_path)?.write_all(&buffer)?;
+
+        self.segment_files.push(segment_path.to_path_buf());
+        self.index.extend(index);
 
         self.memtable.clear();
 
-        self.segment_files.push(segment_path.to_path_buf());
-        self.next_segment_index += 1;
+        self.next_segment_num += 1;
 
         Ok(self.segment_files.last().unwrap())
     }
 }
 
-impl<K: Ord + Serialize, V: Serialize> kvstore::KVStore<K, V, io::Error> for LSMTree<K, V> {
+impl<K: Ord + Serialize + Hash + Copy, V: Serialize> kvstore::KVStore<K, V, io::Error>
+    for LSMTree<K, V>
+{
     fn put(&mut self, k: K, v: V) -> IOResult<()> {
         self.memtable.insert(k, v);
 
