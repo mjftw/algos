@@ -1,6 +1,6 @@
 pub trait KVStore<K, V, E> {
     fn put(&mut self, k: K, v: V) -> Result<(), E>;
-    fn get(&self, k: &K) -> Result<Option<&V>, E>;
+    fn get(&self, k: &K) -> Result<Option<V>, E>;
 }
 
 // impl<K: Eq + Hash, V> KVStore<K, V, String> for HashMap<K, V> {
