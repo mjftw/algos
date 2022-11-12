@@ -1,4 +1,4 @@
 # Algos
 
-A collection of example algorithm implementations.
+A collection of toy algorithm implementations for learning purposes.
 
