@@ -12,12 +12,34 @@ use std::{fs, io};
 
 use algos::{GenericError, GenericResult};
 
+#[derive(Debug, Serialize, Deserialize)]
+enum Record<V> {
+    Value(V),
+    Tombstone,
+}
+
+impl<V> Record<V> {
+    fn get(&self) -> Option<&V> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Tombstone => None,
+        }
+    }
+
+    fn get_owned(self) -> Option<V> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Tombstone => None,
+        }
+    }
+}
+
 pub struct LSMTree<K: Ord + Hash, V> {
     storage_dir: PathBuf,
     index: RBTree<K, (u32, u64)>,
     records_per_index: usize,
     next_segment_num: u32,
-    memtable: RBTree<K, V>,
+    memtable: RBTree<K, Record<V>>,
     memtable_max_size: usize,
 }
 
@@ -54,7 +76,7 @@ impl<'de, K: Ord + Copy + Serialize + Hash + Deserialize<'de>, V: Serialize + De
 
     fn write_new_segment(&mut self) -> GenericResult<()> {
         let segment_num = self.next_segment_num;
-        let memtable_vec: Vec<(&K, &V)> = self.memtable.iter().collect();
+        let memtable_vec: Vec<(&K, &Record<V>)> = self.memtable.iter().collect();
         let mut buffer = Vec::<u8>::new();
         let mut index: HashMap<K, (u32, u64)> = HashMap::new();
 
@@ -80,7 +102,15 @@ impl<'de, K: Ord + Copy + Serialize + Hash + Deserialize<'de>, V: Serialize + De
     }
 
     fn get_from_memtable(&self, k: &K) -> Option<&V> {
-        self.memtable.get(k)
+        // Search the memtable from the back so that the last written key is found
+        // The chain line is required to work around an issue with the reversed RBTree iter;
+        //   it doesn't return the first value for some reason!
+        self.memtable
+            .iter()
+            .rev()
+            .chain(self.memtable.iter().take(1))
+            .find(|(key, _)| **key == *k)
+            .and_then(|(_, record)| record.get())
     }
 
     fn get_from_segments(&self, k: &K) -> GenericResult<Option<V>> {
@@ -112,12 +142,14 @@ impl<'de, K: Ord + Copy + Serialize + Hash + Deserialize<'de>, V: Serialize + De
             (None, _) => None,
         };
 
-        let value = buffer.and_then(|buffer| {
-            buffer
-                .into_iter()
-                .find(|(key, _)| *key == *k)
-                .and_then(|(_, value)| Some(value))
-        });
+        let value = buffer
+            .and_then(|buffer| {
+                buffer
+                    .into_iter()
+                    .find(|(key, _)| *key == *k)
+                    .and_then(|(_, value)| Some(value))
+            })
+            .and_then(|record| record.get_owned());
 
         Ok(value)
     }
@@ -127,7 +159,7 @@ impl<'de, K: Ord + Copy + Serialize + Hash + Deserialize<'de>, V: Serialize + De
         segment_num: u32,
         offset: u64,
         limit: Option<u64>,
-    ) -> GenericResult<Vec<(K, V)>> {
+    ) -> GenericResult<Vec<(K, Record<V>)>> {
         let segment_path = self.segment_path(segment_num);
 
         let mut segment = fs::File::open(segment_path)?;
@@ -151,7 +183,7 @@ impl<
     > kvstore::KVStore<K, V, GenericError> for LSMTree<K, V>
 {
     fn put(&mut self, k: K, v: V) -> GenericResult<()> {
-        self.memtable.insert(k, v);
+        self.memtable.insert(k, Record::Value(v));
 
         if self.memtable_over_size() {
             self.write_new_segment()?;
@@ -173,6 +205,10 @@ impl<
             .map(|found| found.to_owned())
             .or(self.get_from_segments(k)?))
     }
+
+    fn remove(&mut self, k: K) -> Result<(), GenericError> {
+        Ok(self.memtable.insert(k, Record::Tombstone))
+    }
 }
 
 #[cfg(test)]
@@ -180,7 +216,7 @@ mod tests {
     use super::LSMTree;
     use crate::storage::kvstore::KVStore;
     use rand::{seq::SliceRandom, Rng};
-    use std::collections::HashMap;
+    use std::{collections::HashMap, iter::Chain};
     use utils::run_test_with_temp_dir;
 
     #[test]
@@ -272,6 +308,27 @@ mod tests {
             for i in 101..200 {
                 assert_eq!(lsm_tree.get(&i).unwrap(), None);
             }
+        })
+    }
+
+    #[test]
+    fn remove_works_with_memtable() {
+        run_test_with_temp_dir(|temp_dir| {
+            let mut lsm_tree = LSMTree::new(temp_dir, 10, 7).unwrap();
+
+            for i in 1..100 {
+                lsm_tree.put(i, format!("{}", i).to_string()).unwrap();
+            }
+
+            assert_eq!(lsm_tree.get(&5).unwrap(), Some("5".to_string()));
+
+            lsm_tree.remove(5).unwrap();
+
+            // Write a load more values to force flushing memtable to disc
+            for i in 101..200 {
+                lsm_tree.put(i, format!("{}", i).to_string()).unwrap();
+            }
+            assert_eq!(lsm_tree.get(&5).unwrap(), None);
         })
     }
 
