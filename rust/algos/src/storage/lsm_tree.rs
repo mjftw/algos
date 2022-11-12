@@ -5,9 +5,8 @@ use super::kvstore;
 use super::rbtree::RBTree;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::hash::Hash;
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
@@ -22,11 +21,8 @@ pub struct LSMTree<K: Ord + Hash, V> {
     memtable_max_size: usize,
 }
 
-impl<
-        'de,
-        K: Display + Ord + Copy + Serialize + Hash + Deserialize<'de>,
-        V: Serialize + Deserialize<'de>,
-    > LSMTree<K, V>
+impl<'de, K: Ord + Copy + Serialize + Hash + Deserialize<'de>, V: Serialize + Deserialize<'de>>
+    LSMTree<K, V>
 {
     pub fn new(
         storage_dir: &Path,
@@ -65,7 +61,7 @@ impl<
         for kv_chunk in memtable_vec.chunks(self.records_per_index) {
             let key_offset = buffer.len().try_into()?;
 
-            ciborium::ser::into_writer(&self.memtable, &mut buffer)?;
+            ciborium::ser::into_writer(kv_chunk, &mut buffer)?;
             let (index_key, _) = *kv_chunk.first().unwrap();
 
             index.insert(*index_key, (segment_num, key_offset));
@@ -84,33 +80,65 @@ impl<
     }
 
     fn get_from_memtable(&self, k: &K) -> Option<&V> {
-        println!("Searching memtable for key: {}", k);
         self.memtable.get(k)
     }
 
     fn get_from_segments(&self, k: &K) -> GenericResult<Option<V>> {
-        println!("Searching disc for key: {}", k);
+        let mut index_iter = self.index.iter();
 
-        match self.index.iter().find(|(index_key, _)| **index_key < *k) {
-            Some((_, (segment_num, offset))) => {
-                let segment_path = self.segment_path(*segment_num);
-
-                let mut segment = fs::File::open(segment_path)?;
-
-                // TODO: Only read until next key rather than rest of file
-                segment.seek(io::SeekFrom::Start(*offset))?;
-
-                let buffer: Vec<(K, V)> = ciborium::de::from_reader(segment)?;
-
-                let value = buffer
-                    .into_iter()
-                    .find(|(key, _)| *key == *k)
-                    .and_then(|(_, value)| Some(value));
-
-                Ok(value)
+        let mut before_index_hit = index_iter.next();
+        let mut index_hit = index_iter.next();
+        while {
+            match index_hit {
+                Some((index_key, _)) if *index_key <= *k => true,
+                _ => false,
             }
-            None => Ok(None),
+        } {
+            before_index_hit = index_hit;
+            index_hit = index_iter.next();
         }
+
+        let buffer = match (before_index_hit, index_hit) {
+            (Some((_, (segment_num, offset))), Some((_, (segment_num2, offset2))))
+                if segment_num == segment_num2 =>
+            {
+                Some(self.read_segment(*segment_num, *offset, Some(offset2 - offset))?)
+            }
+
+            (Some((_, (segment_num, offset))), _) => {
+                Some(self.read_segment(*segment_num, *offset, None)?)
+            }
+
+            (None, _) => None,
+        };
+
+        let value = buffer.and_then(|buffer| {
+            buffer
+                .into_iter()
+                .find(|(key, _)| *key == *k)
+                .and_then(|(_, value)| Some(value))
+        });
+
+        Ok(value)
+    }
+
+    fn read_segment(
+        &self,
+        segment_num: u32,
+        offset: u64,
+        limit: Option<u64>,
+    ) -> GenericResult<Vec<(K, V)>> {
+        let segment_path = self.segment_path(segment_num);
+
+        let mut segment = fs::File::open(segment_path)?;
+
+        segment.seek(io::SeekFrom::Start(offset))?;
+
+        limit.map(|limit| {
+            (&mut segment).take(limit);
+        });
+
+        Ok(ciborium::de::from_reader(segment)?)
     }
 }
 
@@ -118,7 +146,7 @@ impl<
 // required for current get() implementation
 impl<
         'de,
-        K: Display + Ord + Copy + Serialize + Deserialize<'de> + Hash,
+        K: Ord + Copy + Serialize + Deserialize<'de> + Hash,
         V: Clone + Serialize + Deserialize<'de>,
     > kvstore::KVStore<K, V, GenericError> for LSMTree<K, V>
 {
@@ -135,7 +163,7 @@ impl<
     // Not nice to have to clone the value found in the memtable.
     // This is done because on memtable miss the value is read from disc and the variable then needs
     //  to be owned by something. This means that we can't return a reference to it!
-    // If we can't return a reference to this then we can't return a refernce to the memtable hit
+    // If we can't return a reference to this then we can't return a reference to the memtable hit
     //  value either.
     // This has the knock on effect of requiring that the value type implement Clone, which is not
     //  ideal.
@@ -149,24 +177,18 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use rand::{seq::SliceRandom, Rng};
-
-    use utils::run_test_with_temp_dir;
-
-    use crate::storage::kvstore::KVStore;
-
     use super::LSMTree;
+    use crate::storage::kvstore::KVStore;
+    use rand::{seq::SliceRandom, Rng};
+    use std::collections::HashMap;
+    use utils::run_test_with_temp_dir;
 
     #[test]
     fn write_readback_test_random() {
-        let num_test_insertions = 10000;
+        let num_test_insertions = 100000;
         let num_test_unique_keys = 100;
 
         run_test_with_temp_dir(|temp_dir| {
-            dbg!(temp_dir);
-
             let mut rng = rand::thread_rng();
 
             let mut lsm_tree = LSMTree::<u32, String>::new(
@@ -205,19 +227,50 @@ mod tests {
     #[test]
     fn write_readback_test_sequential() {
         run_test_with_temp_dir(|temp_dir| {
-            dbg!(temp_dir);
+            let mut lsm_tree = LSMTree::new(temp_dir, 101, 29).unwrap();
 
-            let mut lsm_tree = LSMTree::new(temp_dir, 100, 10).unwrap();
-
-            for i in 1..10000 {
+            for i in 1..1000 {
                 lsm_tree.put(i, format!("{}", i).to_string()).unwrap();
             }
 
-            for i in 1..10000 {
+            for i in 1..1000 {
                 let result = lsm_tree.get(&i).unwrap();
                 let expected = Some(format!("{}", i).to_string());
 
                 assert_eq!(result, expected);
+            }
+        })
+    }
+
+    #[test]
+    fn write_readback_test_sequential_reversed() {
+        run_test_with_temp_dir(|temp_dir| {
+            let mut lsm_tree = LSMTree::new(temp_dir, 101, 29).unwrap();
+
+            for i in 1..1000 {
+                lsm_tree.put(i, format!("{}", i).to_string()).unwrap();
+            }
+
+            for i in 1000..1 {
+                let result = lsm_tree.get(&i).unwrap();
+                let expected = Some(format!("{}", i).to_string());
+
+                assert_eq!(result, expected);
+            }
+        })
+    }
+
+    #[test]
+    fn write_readback_fails_on_missing_key() {
+        run_test_with_temp_dir(|temp_dir| {
+            let mut lsm_tree = LSMTree::new(temp_dir, 10, 7).unwrap();
+
+            for i in 1..100 {
+                lsm_tree.put(i, format!("{}", i).to_string()).unwrap();
+            }
+
+            for i in 101..200 {
+                assert_eq!(lsm_tree.get(&i).unwrap(), None);
             }
         })
     }
