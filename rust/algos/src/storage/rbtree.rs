@@ -1,6 +1,9 @@
 extern crate rbtree;
 use serde::{Serialize, Serializer};
-use std::ops::{Deref, DerefMut};
+use std::{
+    fmt::{Debug, Display},
+    ops::{Deref, DerefMut},
+};
 
 pub struct RBTree<K: Ord, V>(rbtree::RBTree<K, V>);
 
@@ -36,5 +39,29 @@ impl<K: Ord + Serialize, V: Serialize> Serialize for RBTree<K, V> {
 impl<K: Ord, V> From<rbtree::RBTree<K, V>> for RBTree<K, V> {
     fn from(t: rbtree::RBTree<K, V>) -> Self {
         RBTree(t)
+    }
+}
+
+impl<K: Display + Ord, V: Display> Display for RBTree<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            &self
+                .iter()
+                .map(|(k, v)| format!("({}, {})", k, v))
+                .collect::<Vec<String>>()
+                .join(", "),
+        )
+    }
+}
+
+impl<K: Debug + Ord, V: Debug> Debug for RBTree<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            &self
+                .iter()
+                .map(|(k, v)| format!("({:?}, {:?})", k, v))
+                .collect::<Vec<String>>()
+                .join(", "),
+        )
     }
 }
