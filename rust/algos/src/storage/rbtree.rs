@@ -2,8 +2,6 @@ extern crate rbtree;
 use serde::{Serialize, Serializer};
 use std::ops::{Deref, DerefMut};
 
-use algos::GenericResult;
-
 pub struct RBTree<K: Ord, V>(rbtree::RBTree<K, V>);
 
 impl<K: Ord, V> RBTree<K, V> {
