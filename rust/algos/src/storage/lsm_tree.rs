@@ -220,6 +220,19 @@ mod tests {
     use utils::run_test_with_temp_dir;
 
     #[test]
+    fn write_readback_gets_latest_value() {
+        run_test_with_temp_dir(|temp_dir| {
+            let mut lsm_tree = LSMTree::new(temp_dir, 10, 7).unwrap();
+
+            lsm_tree.put(42, "hello").unwrap();
+            assert_eq!(lsm_tree.get(&42).unwrap(), Some("hello"));
+
+            lsm_tree.put(42, "world").unwrap();
+            assert_eq!(lsm_tree.get(&42).unwrap(), Some("world"));
+        })
+    }
+
+    #[test]
     fn write_readback_test_random() {
         let num_test_insertions = 100000;
         let num_test_unique_keys = 100;
