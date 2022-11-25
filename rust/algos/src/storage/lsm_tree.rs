@@ -13,7 +13,7 @@ use std::{fs, io};
 use algos::{GenericError, GenericResult};
 
 #[derive(Debug, Serialize, Deserialize)]
-enum Record<V> {
+pub enum Record<V> {
     Value(V),
     Tombstone,
 }
@@ -34,11 +34,29 @@ impl<V> Record<V> {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Metadata {
+    segment_head: u32,
+    segment_tail: u32,
+}
+
+impl Metadata {
+    pub fn next_segment_num(&self) -> u32 {
+        self.segment_tail + 1
+    }
+
+    pub fn advance_segment_tail(&mut self) {
+        self.segment_tail += 1
+    }
+}
+
+const METADATA_FILENAME: &'static str = "meta";
+
 pub struct LSMTree<K: Ord + Hash, V> {
     storage_dir: PathBuf,
     index: RBTree<K, (u32, u64)>,
     records_per_index: usize,
-    next_segment_num: u32,
+    metadata: Metadata,
     memtable: RBTree<K, Record<V>>,
     memtable_max_size: usize,
 }
@@ -51,16 +69,41 @@ impl<'de, K: Ord + Copy + Serialize + Hash + Deserialize<'de>, V: Serialize + De
         memtable_max_size: usize,
         records_per_index: usize,
     ) -> GenericResult<Self> {
-        fs::create_dir_all(storage_dir)?;
+        //TODO: Do something with errors here.
+        // Also probably better to have some control over whether we do this or not!
+        // Also better to have this in an `initialise` function rather than constructor
+        let metadata = match Self::load_metadata(&storage_dir.join(METADATA_FILENAME)) {
+            Ok(metadata) => Ok(metadata),
+            Err(err) => Self::init_storage_dir(storage_dir),
+        }?;
 
         Ok(LSMTree {
             storage_dir: storage_dir.to_owned(),
             index: RBTree::new(),
             records_per_index: records_per_index,
-            next_segment_num: 0,
+            metadata: metadata,
             memtable: RBTree::new(),
             memtable_max_size: memtable_max_size,
         })
+    }
+
+    fn init_storage_dir(path: &Path) -> GenericResult<Metadata> {
+        fs::create_dir_all(path)?;
+
+        Ok(Metadata {
+            segment_head: 0,
+            segment_tail: 0,
+        })
+    }
+
+    fn load_metadata(path: &Path) -> GenericResult<Metadata> {
+        let file = fs::File::open(path)?;
+        Ok(ciborium::de::from_reader::<'de, Metadata, _>(file)?)
+    }
+
+    fn write_metadata(path: &Path, metadata: &Metadata) -> GenericResult<()> {
+        let file = fs::File::create(path)?;
+        Ok(ciborium::ser::into_writer(metadata, file)?)
     }
 
     fn memtable_over_size(&self) -> bool {
@@ -75,7 +118,7 @@ impl<'de, K: Ord + Copy + Serialize + Hash + Deserialize<'de>, V: Serialize + De
     }
 
     fn write_new_segment(&mut self) -> GenericResult<()> {
-        let segment_num = self.next_segment_num;
+        let segment_num = self.metadata.next_segment_num();
         let memtable_vec: Vec<(&K, &Record<V>)> = self.memtable.iter().collect();
         let mut buffer = Vec::<u8>::new();
         let mut index: HashMap<K, (u32, u64)> = HashMap::new();
@@ -96,7 +139,7 @@ impl<'de, K: Ord + Copy + Serialize + Hash + Deserialize<'de>, V: Serialize + De
 
         self.memtable.clear();
 
-        self.next_segment_num += 1;
+        self.metadata.advance_segment_tail();
 
         Ok(())
     }
@@ -362,7 +405,7 @@ mod tests {
 
             let result = panic::catch_unwind(|| test(&temp_dir));
 
-            remove_temp_dir(&temp_dir).unwrap();
+            // remove_temp_dir(&temp_dir).unwrap();
 
             assert!(result.is_ok())
         }
